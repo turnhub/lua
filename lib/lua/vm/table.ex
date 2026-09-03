@@ -84,6 +84,10 @@ defmodule Lua.VM.Table do
   encode) get split storage with no extra effort.
   """
   @spec from_data(map()) :: t()
+  # Every `{}` constructor allocates through here; an empty map has nothing
+  # to sort and nothing to fold, so skip straight to the empty struct.
+  def from_data(data) when map_size(data) == 0, do: %__MODULE__{}
+
   def from_data(data) when is_map(data) do
     split_from_map(%__MODULE__{}, data)
   end
@@ -112,6 +116,27 @@ defmodule Lua.VM.Table do
   end
 
   defp split_from_map(table, data) do
+    case string_keys(:maps.to_list(data), []) do
+      {:ok, keys} -> hash_only(table, data, keys)
+      :error -> sorted_fold(table, data)
+    end
+  end
+
+  # Every key is a string, so nothing routes to the array, nothing touches the
+  # border, and no key can be dead in a table this function is allowed to see
+  # (both callers reset `dead`). That makes the whole build a rename of the
+  # caller's map plus the iteration order, instead of N struct-rebuilding
+  # `put/3` calls.
+  #
+  # `order_tail` is the descending key list because that is exactly the struct
+  # the fold produced: it sorted the pairs and `insert_hash` prepended each
+  # key. Iteration order over a stdlib table is therefore bit-for-bit what it
+  # has always been.
+  defp hash_only(table, data, keys) do
+    %{table | data: data, order: [], order_tail: Enum.sort(keys, :desc), order_index: nil, order_arr: nil}
+  end
+
+  defp sorted_fold(table, data) do
     # Sorted fold: integer keys come first, ascending (term order puts numbers
     # before other keys), so contiguous appends hit put/3's O(1) array path
     # instead of parking in the hash and draining via absorb_from_hash — an
@@ -119,6 +144,15 @@ defmodule Lua.VM.Table do
     # >32 entries). The sort is O(n log n), cheaper than the O(n^2) it replaces.
     Enum.reduce(Enum.sort(data), table, fn {k, v}, acc -> put(acc, k, v) end)
   end
+
+  # Collects the keys when the map is entirely string-keyed with no `nil`
+  # values — the shape every stdlib library table has. A `nil` value means
+  # "absent" in Lua, so a map carrying one has to go through `put/3`'s delete
+  # branch; anything other than a string key may normalize into the array.
+  defp string_keys([], keys), do: {:ok, keys}
+  defp string_keys([{_k, nil} | _rest], _keys), do: :error
+  defp string_keys([{k, _v} | rest], keys) when is_binary(k), do: string_keys(rest, [k | keys])
+  defp string_keys(_pairs, _keys), do: :error
 
   @doc """
   Writes `value` into the table under `key`, honoring Lua semantics:
@@ -198,6 +232,27 @@ defmodule Lua.VM.Table do
     end
   end
 
+  # No dead keys means the resurrection branch cannot apply, so the write is
+  # either an in-place overwrite or a fresh append. This is the shape every
+  # `t.field = v` / `t[k] = v` on a table that has never had a key removed
+  # takes, so it skips the `dead` probe entirely.
+  defp insert_hash(%__MODULE__{data: data, order_tail: order_tail, dead: dead} = table, key, value)
+       when map_size(dead) == 0 do
+    table = if positive_int?(key), do: %{table | border: :dirty}, else: table
+
+    if :maps.is_key(key, data) do
+      %{table | data: :maps.put(key, value, data)}
+    else
+      %{
+        table
+        | data: :maps.put(key, value, data),
+          order_tail: [key | order_tail],
+          order_index: nil,
+          order_arr: nil
+      }
+    end
+  end
+
   defp insert_hash(%__MODULE__{data: data, order: order, order_tail: order_tail, dead: dead} = table, key, value) do
     # A positive-integer hash key sits adjacent to the probe range and can
     # change #t once a contiguous fill reaches it, so invalidate the cache.
@@ -205,7 +260,7 @@ defmodule Lua.VM.Table do
     table = if positive_int?(key), do: %{table | border: :dirty}, else: table
 
     cond do
-      Map.has_key?(dead, key) ->
+      :maps.is_key(key, dead) ->
         merged_order = order ++ Enum.reverse(order_tail)
         new_order = Enum.reject(merged_order, &(&1 === key))
 

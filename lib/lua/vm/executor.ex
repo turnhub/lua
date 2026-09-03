@@ -187,9 +187,10 @@ defmodule Lua.VM.Executor do
 
   def call_function({:compiled_closure, callee_proto, callee_upvalues}, args, state) do
     # Compiled callees route through the dispatcher. The dispatcher manages
-    # its own register file setup, vararg routing, and open-upvalue save/
-    # restore — `Dispatcher.execute/4` mirrors the semantics of this
-    # function for the bytecode-encoded path.
+    # its own register file setup and vararg routing, and isolates open
+    # upvalues by threading them as a dispatch-loop parameter seeded empty
+    # at this boundary — `Dispatcher.execute/4` mirrors the semantics of
+    # this function for the bytecode-encoded path.
     Dispatcher.execute(callee_proto, args, callee_upvalues, state)
   end
 
@@ -498,12 +499,6 @@ defmodule Lua.VM.Executor do
     coerce_numeric_for_controls(init, limit, step, state)
   end
 
-  @doc false
-  @spec dispatcher_close_open_upvalues_at_or_above(State.t(), non_neg_integer()) :: State.t()
-  def dispatcher_close_open_upvalues_at_or_above(state, threshold) do
-    close_open_upvalues_at_or_above(state, threshold)
-  end
-
   # ── Dispatcher bridges: B5c-v2 ──────────────────────────────────────────
   #
   # `:self` method resolution. Wraps `index_value/6` so __index metamethod
@@ -579,14 +574,24 @@ defmodule Lua.VM.Executor do
     # Publish the source line baked into the call opcode by the encoder so
     # raise sites reading `current_position/0` — `error()`'s §6.1 prefix,
     # stdlib bad-argument raises — attribute to the right call site.
-    # Restored after the call so nested invocations don't leak.
-    prev_pos = Process.get(@position_key, @unset)
-    set_position(line, proto.source)
+    #
+    # Every compiled-mode stdlib call lands here, so the bridge talks to the
+    # process dictionary through the BIFs instead of the `Process.*`
+    # wrappers. The restore must run on raise too — not every entry into
+    # this bridge sits under `execute/5`'s `after restore_position/1` net
+    # (e.g. `Lua.call_function/3` invoking a compiled closure), so a
+    # raise-skipped restore would leak a stale position into later,
+    # unrelated evaluations' diagnostics.
+    prev_pos = :erlang.get(@position_key)
+    :erlang.put(@position_key, {line, proto.source})
 
     try do
       call_function(nf, args, state)
     after
-      restore_position(prev_pos)
+      case prev_pos do
+        :undefined -> :erlang.erase(@position_key)
+        pos -> :erlang.put(@position_key, pos)
+      end
     end
   end
 
@@ -622,18 +627,12 @@ defmodule Lua.VM.Executor do
     end
   end
 
-  @doc false
-  @spec dispatcher_call_info(term(), term(), non_neg_integer()) :: call_frame()
-  def dispatcher_call_info(proto, name_hint, line) do
-    # Hot path: every Lua call pushes one of these. Keep it a flat 3-tuple
-    # carrying the raw `name_hint` tag, and defer the `hint_name`/
-    # `hint_namewhat` decoding to the cold readers (`frame_name/1`,
-    # `frame_namewhat/1`) that only run during traceback formatting and
-    # `debug.getinfo`. A tuple is ~4 words vs ~7 for the old 4-key map, and
-    # skips two function calls per call frame.
-    {proto.source, line, name_hint}
-  end
-
+  # Every Lua call pushes one call frame, so the runtime shape is a flat
+  # 3-tuple `{source, line, name_hint}` carrying the raw `name_hint` tag;
+  # the `hint_name` / `hint_namewhat` decoding is deferred to the cold
+  # readers (`frame_name/1`, `frame_namewhat/1`) that only run during
+  # traceback formatting and `debug.getinfo`. A tuple is ~4 words against
+  # ~7 for a 4-key map, and skips two function calls per frame.
   @typedoc false
   @type call_frame() :: {term(), non_neg_integer(), term()} | map()
 
@@ -949,7 +948,7 @@ defmodule Lua.VM.Executor do
          instruction_count
        ) do
     cell_ref = elem(upvalues, index)
-    value = Map.get(state.upvalue_cells, cell_ref)
+    value = :maps.get(cell_ref, state.upvalue_cells, nil)
     regs = put_elem(regs, dest, value)
     do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
   end
@@ -991,9 +990,9 @@ defmodule Lua.VM.Executor do
          instruction_count
        ) do
     value =
-      case Map.get(state.open_upvalues, reg) do
+      case :maps.get(reg, state.open_upvalues, nil) do
         nil -> elem(regs, reg)
-        cell_ref -> Map.get(state.upvalue_cells, cell_ref)
+        cell_ref -> :maps.get(cell_ref, state.upvalue_cells, nil)
       end
 
     regs = put_elem(regs, dest, value)
@@ -1043,7 +1042,7 @@ defmodule Lua.VM.Executor do
          instruction_count
        ) do
     state =
-      case Map.get(state.open_upvalues, reg) do
+      case :maps.get(reg, state.open_upvalues, nil) do
         nil ->
           state
 
@@ -1287,7 +1286,7 @@ defmodule Lua.VM.Executor do
     {captured_upvalues_reversed, state} =
       Enum.reduce(nested_proto.upvalue_descriptors, {[], state}, fn
         {:parent_local, reg, _name}, {cells, state} ->
-          case Map.get(state.open_upvalues, reg) do
+          case :maps.get(reg, state.open_upvalues, nil) do
             nil ->
               cell_ref = make_ref()
               value = elem(regs, reg)
@@ -1324,6 +1323,42 @@ defmodule Lua.VM.Executor do
 
     regs = put_elem(regs, dest, closure)
     do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+  end
+
+  # ── call_self — a call whose callee is the running prototype ───────────────
+  #
+  # `Lua.Compiler.Peephole` emits this for a `local function` it has proved
+  # is permanently bound to itself, dropping the `get_upvalue` that used to
+  # load the closure into the callee register. The dispatcher recurses
+  # without materialising a closure at all; the interpreter has no such
+  # short cut to take, so it reconstructs the value the upvalue cell holds —
+  # this prototype closed over these upvalues — and runs an ordinary call.
+  # Identical work, identical results, identical errors.
+  defp do_execute(
+         [{:call_self, base, arg_count, result_count, name_hint} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    tag = if proto.bytecode, do: :compiled_closure, else: :lua_closure
+    regs = put_elem(regs, base, {tag, proto, upvalues})
+
+    do_execute(
+      [{:call, base, arg_count, result_count, name_hint} | rest],
+      regs,
+      upvalues,
+      proto,
+      state,
+      cont,
+      frames,
+      line,
+      instruction_count
+    )
   end
 
   # ── call — Lua closures via CPS frames; native functions inline ────────────
@@ -2123,6 +2158,152 @@ defmodule Lua.VM.Executor do
     do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
   end
 
+  # ── Constant-folded arithmetic ─────────────────────────────────────────────
+  #
+  # `Lua.Compiler.Peephole` folds the `load_constant` that materialised a
+  # literal into the operation that consumes it, so `k` is a value rather
+  # than a register index. Same three tiers as the register forms; the slow
+  # path hands `k` to the same metamethod bridge, so `__add` / `__sub` /
+  # `__mul` and the `(local 'n')` error suffix behave identically.
+
+  defp do_execute(
+         [{:add_k, dest, a, k, _hint_a} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       )
+       when is_integer(:erlang.element(a + 1, regs)) and is_integer(k) do
+    sum = :erlang.element(a + 1, regs) + k
+    regs = :erlang.setelement(dest + 1, regs, Numeric.to_signed_int64(sum))
+    do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+  end
+
+  defp do_execute(
+         [{:add_k, dest, a, k, hint_a} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    val_a = elem(regs, a)
+
+    if is_number(val_a) and is_number(k) do
+      regs = put_elem(regs, dest, val_a + k)
+      do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+    else
+      src = proto.source
+
+      {result, new_state} =
+        try_binary_metamethod("__add", val_a, k, state, fn ->
+          safe_add(val_a, k, line, src, hint_a, nil, state)
+        end)
+
+      regs = put_elem(regs, dest, result)
+      do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
+    end
+  end
+
+  defp do_execute(
+         [{:subtract_k, dest, a, k, _hint_a} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       )
+       when is_integer(:erlang.element(a + 1, regs)) and is_integer(k) do
+    diff = :erlang.element(a + 1, regs) - k
+    regs = :erlang.setelement(dest + 1, regs, Numeric.to_signed_int64(diff))
+    do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+  end
+
+  defp do_execute(
+         [{:subtract_k, dest, a, k, hint_a} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    val_a = elem(regs, a)
+
+    if is_number(val_a) and is_number(k) do
+      regs = put_elem(regs, dest, val_a - k)
+      do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+    else
+      src = proto.source
+
+      {result, new_state} =
+        try_binary_metamethod("__sub", val_a, k, state, fn ->
+          safe_subtract(val_a, k, line, src, hint_a, nil, state)
+        end)
+
+      regs = put_elem(regs, dest, result)
+      do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
+    end
+  end
+
+  defp do_execute(
+         [{:multiply_k, dest, a, k, _hint_a} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       )
+       when is_integer(:erlang.element(a + 1, regs)) and is_integer(k) do
+    prod = :erlang.element(a + 1, regs) * k
+    regs = :erlang.setelement(dest + 1, regs, Numeric.to_signed_int64(prod))
+    do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+  end
+
+  defp do_execute(
+         [{:multiply_k, dest, a, k, hint_a} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    val_a = elem(regs, a)
+
+    if is_number(val_a) and is_number(k) do
+      regs = put_elem(regs, dest, val_a * k)
+      do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+    else
+      src = proto.source
+
+      {result, new_state} =
+        try_binary_metamethod("__mul", val_a, k, state, fn ->
+          safe_multiply(val_a, k, line, src, hint_a, nil, state)
+        end)
+
+      regs = put_elem(regs, dest, result)
+      do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
+    end
+  end
+
   # ── Comparison operations ──────────────────────────────────────────────────
 
   # Comparison fast paths: number-vs-number and string-vs-string skip the
@@ -2189,6 +2370,95 @@ defmodule Lua.VM.Executor do
 
       true ->
         {result, new_state} = compare_le(val_a, val_b, state, line, proto.source)
+
+        regs = put_elem(regs, dest, result)
+        do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
+    end
+  end
+
+  # ── Constant-folded comparisons ────────────────────────────────────────────
+  #
+  # A literal can never carry a metatable, so the fast paths fire whenever
+  # the register side is a number or a binary. Anything else routes through
+  # the same metamethod helpers as the register forms.
+
+  defp do_execute([{:equal_k, dest, a, k} | rest], regs, upvalues, proto, state, cont, frames, line, instruction_count) do
+    val_a = elem(regs, a)
+
+    cond do
+      is_number(val_a) and is_number(k) ->
+        regs = put_elem(regs, dest, val_a == k)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      is_binary(val_a) and is_binary(k) ->
+        regs = put_elem(regs, dest, val_a == k)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      true ->
+        {result, new_state} = try_equality_metamethod(val_a, k, state, fn -> lua_equal(val_a, k) end)
+
+        regs = put_elem(regs, dest, result)
+        do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
+    end
+  end
+
+  defp do_execute(
+         [{:less_than_k, dest, a, k} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    val_a = elem(regs, a)
+
+    cond do
+      is_number(val_a) and is_number(k) ->
+        regs = put_elem(regs, dest, val_a < k)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      is_binary(val_a) and is_binary(k) ->
+        regs = put_elem(regs, dest, val_a < k)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      true ->
+        src = proto.source
+
+        {result, new_state} =
+          try_binary_metamethod("__lt", val_a, k, state, fn -> safe_compare_lt(val_a, k, line, src, state) end)
+
+        regs = put_elem(regs, dest, result)
+        do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
+    end
+  end
+
+  defp do_execute(
+         [{:less_equal_k, dest, a, k} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    val_a = elem(regs, a)
+
+    cond do
+      is_number(val_a) and is_number(k) ->
+        regs = put_elem(regs, dest, val_a <= k)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      is_binary(val_a) and is_binary(k) ->
+        regs = put_elem(regs, dest, val_a <= k)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      true ->
+        {result, new_state} = compare_le(val_a, k, state, line, proto.source)
 
         regs = put_elem(regs, dest, result)
         do_execute(rest, regs, upvalues, proto, new_state, cont, frames, line, instruction_count)
@@ -2494,6 +2764,85 @@ defmodule Lua.VM.Executor do
         {value, state} = index_value(table_val, name, state, line, proto.source, name_hint)
         regs = put_elem(regs, dest, value)
         do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+    end
+  end
+
+  # ── get_field_upvalue ──────────────────────────────────────────────────────
+  #
+  # `Lua.Compiler.Peephole` fuses `get_upvalue` + `get_field` into this — the
+  # shape of every global read outside the chunk itself. Identical to
+  # `:get_field` except the table comes from the upvalue cell instead of a
+  # scratch register.
+
+  defp do_execute(
+         [{:get_field_upvalue, dest, index, name, name_hint} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    cell_ref = elem(upvalues, index)
+    table_val = :maps.get(cell_ref, state.upvalue_cells, nil)
+
+    case table_val do
+      {:tref, id} ->
+        table = :erlang.map_get(id, state.tables)
+
+        case :erlang.map_get(:data, table) do
+          %{^name => value} ->
+            regs = put_elem(regs, dest, value)
+            do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+          _data ->
+            case :erlang.map_get(:metatable, table) do
+              nil ->
+                regs = put_elem(regs, dest, nil)
+                do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+              _ ->
+                {value, state} = index_value(table_val, name, state, line, proto.source, name_hint)
+                regs = put_elem(regs, dest, value)
+                do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+            end
+        end
+
+      _ ->
+        {value, state} = index_value(table_val, name, state, line, proto.source, name_hint)
+        regs = put_elem(regs, dest, value)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+    end
+  end
+
+  # ── set_field_upvalue ──────────────────────────────────────────────────────
+  #
+  # The `set_field` mirror of the fusion above — every global write.
+
+  defp do_execute(
+         [{:set_field_upvalue, index, name, value_reg, name_hint} | rest],
+         regs,
+         upvalues,
+         proto,
+         state,
+         cont,
+         frames,
+         line,
+         instruction_count
+       ) do
+    cell_ref = elem(upvalues, index)
+    table_val = :maps.get(cell_ref, state.upvalue_cells, nil)
+
+    case table_val do
+      {:tref, _} ->
+        value = elem(regs, value_reg)
+        state = table_newindex(table_val, name, value, state)
+        do_execute(rest, regs, upvalues, proto, state, cont, frames, line, instruction_count)
+
+      _ ->
+        raise_index_type_error(table_val, line, proto.source, name_hint, state)
     end
   end
 
@@ -3751,7 +4100,7 @@ defmodule Lua.VM.Executor do
   # environment lives in upvalue slot 0 when present (a chunk loaded via
   # `load(..., env)`), otherwise default to the global table `_G`.
   defp load_env_value(upvalues, state) when tuple_size(upvalues) > 0 do
-    Map.get(state.upvalue_cells, elem(upvalues, 0))
+    :maps.get(elem(upvalues, 0), state.upvalue_cells, nil)
   end
 
   defp load_env_value(_upvalues, state), do: State.g_ref(state)

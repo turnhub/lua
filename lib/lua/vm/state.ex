@@ -7,6 +7,15 @@ defmodule Lua.VM.State do
   alias Lua.VM.RuntimeError
   alias Lua.VM.Table
 
+  # `call_stack`, `call_depth` and `open_upvalues` are control state, not
+  # heap state. The interpreter keeps them here; the dispatcher threads
+  # them as loop parameters (the same discipline as `instruction_count`
+  # below) so an in-mode Lua call allocates no struct at all, and writes
+  # them back into these fields whenever execution leaves the dispatch
+  # loop — an `Executor` bridge, a native callback, a raise site. Anything
+  # outside the loop that reads them (`debug.getinfo`, `error(msg, level)`,
+  # traceback formatting, `check_call_depth!/1`) therefore still sees live
+  # values.
   defstruct call_stack: [],
             # Call depth tracked as an O(1) counter that moves in lockstep
             # with `call_stack` — `length(call_stack)` would be O(depth) per
@@ -210,6 +219,19 @@ defmodule Lua.VM.State do
   @spec set_global(t(), binary(), term()) :: t()
   def set_global(%__MODULE__{g_ref: g_ref} = state, name, value) when is_binary(name) and not is_nil(g_ref) do
     update_table(state, g_ref, fn table -> Table.put(table, name, value) end)
+  end
+
+  @doc """
+  Sets a batch of global variables, left to right, in one `_G` update.
+
+  Equivalent to folding `set_global/3` over `pairs`, but the surrounding
+  `%State{}` and its `tables` map are rebuilt once instead of once per name —
+  which is what installing the standard library's several dozen globals used
+  to cost.
+  """
+  @spec set_globals(t(), [{binary(), term()}]) :: t()
+  def set_globals(%__MODULE__{g_ref: g_ref} = state, pairs) when is_list(pairs) and not is_nil(g_ref) do
+    update_table(state, g_ref, fn table -> Table.put_many(table, pairs) end)
   end
 
   @doc """
