@@ -305,6 +305,33 @@ defmodule Lua.VM.TableIterationTest do
     end
   end
 
+  describe "to_list/1" do
+    test "returns every live pair in iteration order (equals a pairs walk)" do
+      table =
+        %Table{}
+        |> Table.put(1, "one")
+        |> Table.put("x", "ex")
+        |> Table.put(2, "two")
+        |> Table.put("y", "why")
+
+      assert Table.to_list(table) == walk(Table.flush_order(table))
+      assert Table.to_list(table) == [{1, "one"}, {2, "two"}, {"x", "ex"}, {"y", "why"}]
+    end
+
+    test "keeps a dense sequence larger than 32 entries in index order" do
+      # A >32 sequence is where a map-based materialization reorders integer
+      # keys (Erlang's flatmap->hashmap switch). to_list/1 must stay 1-indexed
+      # and ordered so decoded sequences remain proper lists.
+      table = Enum.reduce(1..41, %Table{}, fn i, acc -> Table.put(acc, i, i * 10) end)
+
+      assert Table.to_list(table) == Enum.map(1..41, fn i -> {i, i * 10} end)
+    end
+
+    test "empty table returns an empty list" do
+      assert Table.to_list(%Table{}) == []
+    end
+  end
+
   describe "iteration properties (StreamData)" do
     property "a full walk visits exactly the live key set, once each, with matching values" do
       check all(ops <- entries_gen()) do

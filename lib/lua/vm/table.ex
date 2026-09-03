@@ -516,8 +516,9 @@ defmodule Lua.VM.Table do
   @doc """
   Materializes the full table contents (array + hash) as a single flat map.
 
-  Used by code paths that genuinely need the whole table as a map (decode,
-  display, `string.gsub` replacement lookups). Walks the array once.
+  Used by code paths that genuinely need the whole table as a map (display,
+  `string.gsub` replacement lookups). Walks the array once. Order is not
+  preserved — for ordering-stable pairs use `to_list/1`.
   """
   @spec to_map(t()) :: map()
   def to_map(%__MODULE__{arr: :undefined, data: data}), do: data
@@ -529,6 +530,30 @@ defmodule Lua.VM.Table do
         v -> Map.put(acc, i, v)
       end
     end)
+  end
+
+  @doc """
+  Materializes the full table contents as a list of `{key, value}` pairs in
+  Lua iteration order: array keys `1..arr_n` first in index order, then hash
+  keys in insertion order (identical to a `pairs/1` traversal).
+
+  Unlike `to_map/1`, this preserves iteration order. Decoding through an Erlang
+  map (as `to_map/1` produces) reorders integer keys once a table crosses
+  Erlang's 32-entry flatmap/hashmap threshold, so a sequence larger than 32
+  would no longer start at key `1`. Callers that need ordering-stable pairs
+  (`Lua.VM.Value.decode/2`) use this; callers that only need membership
+  (display, replacement lookups) can keep using `to_map/1`.
+  """
+  @spec to_list(t()) :: [{term(), term()}]
+  def to_list(%__MODULE__{} = table) do
+    table |> flush_order() |> collect_entries(nil, [])
+  end
+
+  defp collect_entries(table, key, acc) do
+    case next_entry(table, key) do
+      nil -> Enum.reverse(acc)
+      {k, v} -> collect_entries(table, k, [{k, v} | acc])
+    end
   end
 
   @doc """

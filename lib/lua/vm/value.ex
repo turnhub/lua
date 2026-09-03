@@ -363,7 +363,7 @@ defmodule Lua.VM.Value do
       table = Map.fetch!(state.tables, id)
       ancestors = Map.put(ancestors, id, true)
 
-      Enum.map(Lua.VM.Table.to_map(table), fn {k, v} -> {k, decode(v, state, ancestors)} end)
+      Enum.map(Lua.VM.Table.to_list(table), fn {k, v} -> {k, decode(v, state, ancestors)} end)
     end
   end
 
