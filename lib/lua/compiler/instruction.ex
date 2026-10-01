@@ -39,6 +39,16 @@ defmodule Lua.Compiler.Instruction do
   def set_table(table, key, value, name_hint \\ nil), do: {:set_table, table, key, value, name_hint}
   def get_field(dest, table, name, name_hint \\ nil), do: {:get_field, dest, table, name, name_hint}
   def set_field(table, name, value, name_hint \\ nil), do: {:set_field, table, name, value, name_hint}
+
+  # Field access through an upvalue-held table, fusing a `get_upvalue` with
+  # the `get_field` / `set_field` that consumes it. Every read or write of a
+  # global is exactly that pair (`_ENV` is an upvalue in every function but
+  # the chunk), so the fused form halves their instruction count.
+  # `Lua.Compiler.Peephole` emits these; codegen never does.
+  def get_field_upvalue(dest, index, name, name_hint \\ nil), do: {:get_field_upvalue, dest, index, name, name_hint}
+
+  def set_field_upvalue(index, name, value, name_hint \\ nil), do: {:set_field_upvalue, index, name, value, name_hint}
+
   def set_list(table, start, count, offset), do: {:set_list, table, start, count, offset}
 
   # Arithmetic.
@@ -78,6 +88,19 @@ defmodule Lua.Compiler.Instruction do
   def less_than(dest, a, b), do: {:less_than, dest, a, b}
   def less_equal(dest, a, b), do: {:less_equal, dest, a, b}
 
+  # Constant-folded variants. The right operand is an inline literal rather
+  # than a register, so the `load_constant` that materialised it disappears
+  # along with the register it occupied. Only `hint_a` survives: the
+  # constant side never carried a name hint to begin with, so error
+  # rendering is unchanged. `Lua.Compiler.Peephole` emits these; codegen
+  # never does.
+  def add_k(dest, a, constant, hint_a \\ nil), do: {:add_k, dest, a, constant, hint_a}
+  def subtract_k(dest, a, constant, hint_a \\ nil), do: {:subtract_k, dest, a, constant, hint_a}
+  def multiply_k(dest, a, constant, hint_a \\ nil), do: {:multiply_k, dest, a, constant, hint_a}
+  def equal_k(dest, a, constant), do: {:equal_k, dest, a, constant}
+  def less_than_k(dest, a, constant), do: {:less_than_k, dest, a, constant}
+  def less_equal_k(dest, a, constant), do: {:less_equal_k, dest, a, constant}
+
   # Unary / logical
   def logical_not(dest, source), do: {:not, dest, source}
   def length(dest, source), do: {:length, dest, source}
@@ -99,6 +122,14 @@ defmodule Lua.Compiler.Instruction do
   # Functions
   def closure(dest, proto_index), do: {:closure, dest, proto_index}
   def call(base, arg_count, result_count, name_hint \\ nil), do: {:call, base, arg_count, result_count, name_hint}
+
+  # A call whose callee is the prototype making it, reached through the
+  # `local function` self-reference upvalue. Operands mirror `call/4` minus
+  # the closure: the engines already hold the prototype and its upvalues, so
+  # `base` is only the argument base and the result destination.
+  # `Lua.Compiler.Peephole` emits these; codegen never does.
+  def call_self(base, arg_count, result_count, name_hint \\ nil),
+    do: {:call_self, base, arg_count, result_count, name_hint}
 
   def tail_call(base, arg_count, name_hint \\ nil), do: {:tail_call, base, arg_count, name_hint}
   def return_instr(base, count), do: {:return, base, count}

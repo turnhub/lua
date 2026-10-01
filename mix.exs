@@ -5,7 +5,7 @@ defmodule Lua.MixProject do
   alias Mix.Tasks.Lua.Eval
 
   @url "https://github.com/tv-labs/lua"
-  @version "1.0.1"
+  @version "1.0.2"
 
   # The curated public API surface rendered on HexDocs. Everything else is an
   # implementation detail: its @moduledoc stays intact for source readers and
@@ -60,6 +60,7 @@ defmodule Lua.MixProject do
         # autolinking to filtered pages, which errors under
         # `--warnings-as-errors`.
         skip_code_autolink_to: [
+          "Lua.VM.Bootstrap.reset/0",
           "Lua.VM.Executor.current_position/0",
           "Lua.VM.ErrorFormatter.to_map/3",
           "Lua.VM.RuntimeError",

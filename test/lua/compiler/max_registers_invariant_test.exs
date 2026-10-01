@@ -62,6 +62,16 @@ defmodule Lua.Compiler.MaxRegistersInvariantTest do
       op == Bytecode.op_test() -> [1]
       op == Bytecode.op_call_zero() -> [1]
       op == Bytecode.op_call_one() -> [1]
+      # Static-arity calls carry no `arg_count` operand: the dispatcher
+      # reads the arguments at `base + 1 .. base + arity`, so the arity is
+      # part of the opcode's register extent even though no slot spells it.
+      op == Bytecode.op_call_one_0() -> [1]
+      op == Bytecode.op_call_zero_0() -> [1]
+      op == Bytecode.op_call_one_1() -> :call_arity_1
+      op == Bytecode.op_call_zero_1() -> :call_arity_1
+      op == Bytecode.op_call_one_2() -> :call_arity_2
+      op == Bytecode.op_call_zero_2() -> :call_arity_2
+      op == Bytecode.op_call_self() -> :call_self
       op == Bytecode.op_return_one() -> [1]
       op == Bytecode.op_return_zero() -> []
       # Table opcodes (B5b-v2).
@@ -106,6 +116,19 @@ defmodule Lua.Compiler.MaxRegistersInvariantTest do
       # multi-return values occupy start..top at runtime, but the only
       # syntactic register operands are table_reg and the start slot.
       op == Bytecode.op_set_list_multi() -> [1, 2]
+      # Peephole fusions. The `_k` family's slot 3 is a literal value, not a
+      # register, so only dest and the left operand count.
+      # `get_field_upvalue`'s slot 2 is an upvalue index and
+      # `set_field_upvalue`'s slot 1 likewise — neither indexes the register
+      # file, and both would blow past `max_registers` if counted.
+      op == Bytecode.op_add_k() -> [1, 2]
+      op == Bytecode.op_subtract_k() -> [1, 2]
+      op == Bytecode.op_multiply_k() -> [1, 2]
+      op == Bytecode.op_less_than_k() -> [1, 2]
+      op == Bytecode.op_less_equal_k() -> [1, 2]
+      op == Bytecode.op_equal_k() -> [1, 2]
+      op == Bytecode.op_get_field_upvalue() -> [1]
+      op == Bytecode.op_set_field_upvalue() -> [3]
       true -> raise "register_positions/1 is missing a case for opcode #{inspect(op)}"
     end
   end
@@ -170,6 +193,20 @@ defmodule Lua.Compiler.MaxRegistersInvariantTest do
         body_bc = :erlang.element(4, instr)
         var_max = Enum.reduce(Tuple.to_list(var_regs_tuple), -1, &max/2)
         Enum.max([base + 2, var_max, max_register_used(body_bc)])
+
+      :call_arity_1 ->
+        # {tag, base, hint, line}: reads base (the callee) and base + 1.
+        :erlang.element(2, instr) + 1
+
+      :call_arity_2 ->
+        :erlang.element(2, instr) + 2
+
+      :call_self ->
+        # {tag, base, arg_count, result_count, hint, line}: the fused
+        # callee is the running prototype, so no register holds it — the
+        # dispatcher reads the arguments at base+1..base+arg_count and
+        # writes the result back at base.
+        :erlang.element(2, instr) + :erlang.element(3, instr)
 
       :self ->
         # {tag, base, obj_reg, method, hint}: reads obj_reg, writes base
@@ -236,6 +273,18 @@ defmodule Lua.Compiler.MaxRegistersInvariantTest do
        if n < 2 then return n end
        return fib(n - 1) + fib(n - 2)
      end
+     """},
+    # A self-recursive `local function` is the shape the peephole pass
+    # fuses into `:call_self` (a global recursion like the entry above
+    # never fuses), so this is what puts that opcode in front of the
+    # walker.
+    {"self-recursive local function (:call_self)",
+     """
+     local function fib(n)
+       if n < 2 then return n end
+       return fib(n - 1) + fib(n - 2)
+     end
+     return fib(5)
      """},
     {"deep temp chain (string.upper)",
      """

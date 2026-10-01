@@ -129,14 +129,7 @@ defmodule Website.LuaSandbox do
           # big binaries it is about to drop). Unlink — and flush an exit
           # signal that may already be queued — so a late `:killed` can't
           # propagate to us once we stop trapping.
-          Process.unlink(worker)
-
-          receive do
-            {:EXIT, ^worker, _} -> :ok
-          after
-            0 -> :ok
-          end
-
+          unlink_worker(worker)
           result
 
         # Worker hit the memory ceiling: max_heap_size kills it with
@@ -151,17 +144,41 @@ defmodule Website.LuaSandbox do
           error_result(started, reason)
 
         # This task is being cancelled by the caller (the LiveView timeout).
-        # Stop the worker and let the cancellation proceed.
+        # Stop the worker and let the cancellation proceed. As on the timeout
+        # path below, `Process.exit/2` only *sends* the kill — if `exit/1` is
+        # caught upstream, the worker's `:killed` would come back after
+        # `trap_exit` is restored, so cut the link before exiting.
         {:EXIT, _other, reason} ->
           Process.exit(worker, :kill)
+          unlink_worker(worker)
           exit(reason)
       after
         @run_timeout_ms ->
+          # `Process.exit/2` only *sends* the kill; the worker's exit signal
+          # comes back tens of microseconds later, which is long enough to
+          # land after the `after` clause below has restored `trap_exit`.
+          # An untrapped `:killed` would then take the caller down with it,
+          # so cut the link before returning rather than racing it.
           Process.exit(worker, :kill)
+          unlink_worker(worker)
           timeout_result(started)
       end
     after
       Process.flag(:trap_exit, prev_trap)
+    end
+  end
+
+  # Drop the link to `worker` and flush an exit signal that already made it
+  # into the mailbox. `Process.unlink/1` guarantees no exit signal from that
+  # link is delivered after it returns, so once this runs the caller is safe
+  # to stop trapping exits.
+  defp unlink_worker(worker) do
+    Process.unlink(worker)
+
+    receive do
+      {:EXIT, ^worker, _reason} -> :ok
+    after
+      0 -> :ok
     end
   end
 
@@ -212,13 +229,16 @@ defmodule Website.LuaSandbox do
       end)
 
     try do
-      bytecode =
+      # Parse once and reuse the chunk for both the bytecode pane and the
+      # evaluation itself. A parse failure falls through to eval!/2 on the
+      # source so the error path still raises the usual CompilerException.
+      {bytecode, runnable} =
         case Lua.parse_chunk(source) do
-          {:ok, %Lua.Chunk{prototype: proto}} -> disassemble(proto)
-          _ -> []
+          {:ok, %Lua.Chunk{prototype: proto} = chunk} -> {disassemble(proto), chunk}
+          _ -> {[], source}
         end
 
-      {results, _lua} = Lua.eval!(lua, source)
+      {results, _lua} = Lua.eval!(lua, runnable)
 
       %{
         status: :ok,
@@ -438,6 +458,16 @@ defmodule Website.LuaSandbox do
   defp format_op_args(:set_table, [t, k, v | _]), do: "r#{t}[#{pretty_arg(k)}], r#{v}"
   defp format_op_args(:get_field, [d, t, name | _]), do: ~s|r#{d}, r#{t}.#{name}|
   defp format_op_args(:set_field, [t, name, v | _]), do: ~s|r#{t}.#{name}, r#{v}|
+
+  # Peephole fusions: the `_k` family's right operand is an inline literal,
+  # and the upvalue-field pair indexes the upvalue table rather than a
+  # register.
+  defp format_op_args(op, [d, a, k | _])
+       when op in [:add_k, :subtract_k, :multiply_k, :equal_k, :less_than_k, :less_equal_k],
+       do: "r#{d}, r#{a}, #{format_lit(k)}"
+
+  defp format_op_args(:get_field_upvalue, [d, idx, name | _]), do: ~s|r#{d}, up[#{idx}].#{name}|
+  defp format_op_args(:set_field_upvalue, [idx, name, v | _]), do: ~s|up[#{idx}].#{name}, r#{v}|
 
   defp format_op_args(:set_list, [t, s, c, o]),
     do: "r#{t}, start=#{s}, count=#{count(c)}, off=#{o}"

@@ -105,6 +105,9 @@ defmodule Lua.Parser do
 
   @doc """
   Parses a chunk (top-level block) from a token list.
+
+  Node ids are not stamped here; `Lua.Compiler.compile/2` stamps every chunk
+  it compiles, including chunks built without the parser. See `Lua.AST.Ids`.
   """
   @spec parse_chunk([token()]) :: {:ok, Chunk.t()} | {:error, term()}
   def parse_chunk(tokens) do
