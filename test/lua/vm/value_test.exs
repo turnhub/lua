@@ -198,6 +198,18 @@ defmodule Lua.VM.ValueTest do
       result = Value.decode(tref, state)
       assert Enum.sort(result) == [{1, "a"}, {2, "b"}, {3, "c"}]
     end
+
+    test "decodes a dense sequence larger than 32 entries in sequence order" do
+      # A dense integer sequence must decode as an ordered, 1-indexed list of
+      # pairs regardless of size. Materializing through an Erlang map reorders
+      # integer keys once a table crosses the 32-entry flatmap->hashmap
+      # threshold, so a >32 sequence would otherwise come back scrambled and no
+      # longer start at key 1.
+      {[decoded], _lua} =
+        Lua.eval!(Lua.new(), "t = {}\nfor i = 1, 41 do t[i] = i * 10 end\nreturn t")
+
+      assert decoded == Enum.map(1..41, fn i -> {i, i * 10} end)
+    end
   end
 
   describe "decode/2 functions" do

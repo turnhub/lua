@@ -49,6 +49,16 @@ is in the [`1.0.0-rc.0`](#100-rc0---2026-05-26) entry below.
 
 ## [Unreleased]
 
+### Fixed
+- Decoding a table now preserves Lua iteration order. `Lua.VM.Value.decode/2`
+  previously materialized tables through an Erlang map, which reorders integer
+  keys once a table crosses Erlang's 32-entry flatmap/hashmap threshold — so a
+  sequence longer than 32 elements decoded as a scrambled, integer-keyed list
+  of pairs that no longer started at key `1`, and `Lua.Table.deep_cast/1` then
+  mis-cast it to a map instead of a list. Decoding now walks the table in
+  `pairs/1` order via the new `Lua.VM.Table.to_list/1`, so sequences of any
+  size round-trip as ordered, 1-indexed lists.
+
 ## [1.0.2] - 2026-07-28
 
 ### Changed

@@ -87,4 +87,22 @@ defmodule Lua.TableTest do
       assert assert_table(table) == "{a = 1, b = {c = 3}}"
     end
   end
+
+  describe "deep_cast over decoded sequences" do
+    test "a sequence larger than 32 entries casts to an ordered list, not a map" do
+      # End-to-end guard for the real-world symptom: a Lua sequence longer than
+      # 32 elements used to decode as a scrambled integer-keyed map (Erlang's
+      # flatmap->hashmap switch reordered the pairs so they no longer started at
+      # key 1), and deep_cast/1 - which detects a list by its leading {1, _}
+      # pair - then mis-cast it to a map. Ordered decoding keeps it a list.
+      {[decoded], _lua} =
+        Lua.eval!(~LUA"""
+        local t = {}
+        for i = 1, 41 do t[i] = i * 10 end
+        return t
+        """)
+
+      assert Lua.Table.deep_cast(decoded) == Enum.map(1..41, fn i -> i * 10 end)
+    end
+  end
 end
